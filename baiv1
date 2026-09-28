@@ -1,0 +1,1440 @@
+-- ======================================================================
+-- SECTION 1: Services & Globals
+-- ======================================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    warn("[BeastHub] LocalPlayer is not available yet.")
+    return
+end
+
+local Camera = Workspace.CurrentCamera
+local Mouse = LocalPlayer:GetMouse()
+
+-- Use getgenv when available, otherwise fall back to _G.
+local ENV = (type(getgenv) == "function" and getgenv()) or _G
+
+local function bhWarn(context, err)
+    warn(("[BeastHub] %s%s"):format(
+        tostring(context),
+        err ~= nil and (": " .. tostring(err)) or ""
+    ))
+end
+
+local function firstOption(value)
+    if type(value) == "table" then
+        return value[1]
+    end
+    return value
+end
+
+local function safeRequire(moduleScript, label)
+    if not moduleScript then
+        bhWarn(label or "require", "module was not found")
+        return nil
+    end
+
+    local ok, result = pcall(require, moduleScript)
+    if not ok then
+        bhWarn(label or "require", result)
+        return nil
+    end
+
+    return result
+end
+
+local function safeRemoteLoad(url, label)
+    if type(loadstring) ~= "function" then
+        bhWarn(label or "remote load", "loadstring is unavailable in this environment")
+        return nil
+    end
+
+    local okHttp, source = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if not okHttp or type(source) ~= "string" or source == "" then
+        bhWarn(label or "remote load", okHttp and "empty response" or source)
+        return nil
+    end
+
+    local chunk, compileErr = loadstring(source)
+    if not chunk then
+        bhWarn((label or "remote load") .. " compile", compileErr)
+        return nil
+    end
+
+    local okRun, result = pcall(chunk)
+    if not okRun then
+        bhWarn((label or "remote load") .. " runtime", result)
+        return nil
+    end
+
+    return result
+end
+
+-- Prevent duplicate copies of the hub from creating duplicate connections/loops.
+ENV.BeastHubLoaded = ENV.BeastHubLoaded or false
+ENV.ConfigLoaded = ENV.ConfigLoaded or false
+ENV.preloadedCustomLoadouts = ENV.preloadedCustomLoadouts or {}
+ENV.preloadedCustomLoadoutNames = ENV.preloadedCustomLoadoutNames or {}
+
+if ENV.BeastHubLoaded then
+    bhWarn("loader", "BeastHub is already running")
+    return
+end
+
+-- Game events. Timeouts prevent an infinite yield if the game changes these paths.
+local GameEvents = ReplicatedStorage:WaitForChild("GameEvents", 15)
+if not GameEvents then
+    bhWarn("startup", "ReplicatedStorage.GameEvents was not found")
+    return
+end
+
+local Notification = GameEvents:WaitForChild("Notification", 10)
+local Event = GameEvents:WaitForChild("Event", 10)
+if not Notification then
+    bhWarn("startup", "GameEvents.Notification was not found; notification listener disabled")
+end
+if not Event then
+    bhWarn("startup", "GameEvents.Event was not found; event features may be unavailable")
+end
+
+-- Generation-based workers make toggles stop reliably and avoid duplicate loops.
+local workerGeneration = {}
+local function setWorker(name, enabled, delaySeconds, callback)
+    workerGeneration[name] = (workerGeneration[name] or 0) + 1
+    local generation = workerGeneration[name]
+
+    if not enabled then
+        return
+    end
+
+    task.spawn(function()
+        while workerGeneration[name] == generation do
+            local ok, err = pcall(callback)
+            if not ok then
+                bhWarn(name, err)
+            end
+            task.wait(math.max(tonumber(delaySeconds) or 0.1, 0.03))
+        end
+    end)
+end
+
+local BeastHubFunctions = nil
+local function safeBHCall(functionName, ...)
+    if type(BeastHubFunctions) ~= "table" then
+        bhWarn(functionName, "BeastHubFunctions is unavailable")
+        return nil
+    end
+
+    local fn = BeastHubFunctions[functionName]
+    if type(fn) ~= "function" then
+        bhWarn(functionName, "helper function was not found")
+        return nil
+    end
+
+    local args = table.pack(...)
+    local ok, result = pcall(function()
+        return fn(table.unpack(args, 1, args.n))
+    end)
+    if not ok then
+        bhWarn(functionName, result)
+        return nil
+    end
+
+    return result
+end
+
+
+-- ======================================================================
+-- SECTION 2: Load Rayfield UI Library
+-- ======================================================================
+
+local Rayfield = safeRemoteLoad("https://sirius.menu/rayfield", "Rayfield")
+if type(Rayfield) ~= "table" then
+    bhWarn("startup", "Rayfield could not be loaded")
+    return
+end
+ENV.BeastHubRayfield = Rayfield
+
+-- Load BeastHubFunctions without allowing a network/compile error to crash the script.
+BeastHubFunctions = safeRemoteLoad(
+    "https://raw.githubusercontent.com/bhubAlt/bhub_alt/refs/heads/main/myFunctions2.lua",
+    "BeastHubFunctions"
+)
+if type(BeastHubFunctions) ~= "table" then
+    bhWarn("startup", "BeastHubFunctions could not be loaded")
+    return
+end
+ENV.BeastHubFunctions = BeastHubFunctions
+
+-- u2 / PetRegistry is optional in this reconstruction. The original fallback
+-- incorrectly passed a returned Lua table to require(), causing a runtime error.
+local u2
+local u2Module = ReplicatedStorage:FindFirstChild("u2")
+if u2Module and u2Module:IsA("ModuleScript") then
+    u2 = safeRequire(u2Module, "u2")
+else
+    u2 = safeRemoteLoad(
+        "https://raw.githubusercontent.com/bhubAlt/bhub_alt/refs/heads/main/u2.lua",
+        "u2"
+    )
+end
+
+local PetRegistry = nil
+if type(u2) == "table" and type(u2.Data) == "table" then
+    PetRegistry = u2.Data.PetRegistry
+end
+if not PetRegistry then
+    bhWarn("u2", "PetRegistry was unavailable; continuing because this file does not directly use it")
+end
+
+task.wait(0.1)
+
+
+-- ======================================================================
+-- SECTION 3: Create Main Window
+-- ======================================================================
+
+local Window
+do
+    local okWindow, result = pcall(function()
+        return Rayfield:CreateWindow({
+            Name = "BeastHub",
+            LoadingTitle = "BeastHub",
+            LoadingSubtitle = "Grow a Garden",
+            Theme = "Default",
+            ToggleUIKeybind = "H",
+            ConfigurationSaving = {
+                Enabled = type(readfile) == "function"
+                    and type(writefile) == "function"
+                    and type(isfolder) == "function"
+                    and type(makefolder) == "function",
+                FolderName = "BeastHub",
+                FileName = "GrowAGarden",
+            },
+        })
+    end)
+
+    if not okWindow or type(result) ~= "table" then
+        bhWarn("Rayfield:CreateWindow", okWindow and "window was not returned" or result)
+        return
+    end
+
+    Window = result
+end
+
+
+-- ======================================================================
+-- SECTION 4: Main Tab (s9 + s6)
+-- ======================================================================
+
+local MainTab = Window:CreateTab("Main", "house")
+
+MainTab:CreateSection("Script")
+MainTab:CreateParagraph({
+    Title = "Shortcut Key = H",
+    Content = "Press H in keyboard to hide/unhide script interface for PC",
+})
+
+-- Player section
+MainTab:CreateSection("Player")
+
+-- Walk Speed
+local walkSpeed = 16
+MainTab:CreateSlider({
+    Name = "Walk Speed",
+    Range = {16, 200},
+    Increment = 1,
+    Suffix = "spd",
+    CurrentValue = 16,
+    Flag = "walkSpeed",
+    Callback = function(value)
+        walkSpeed = value
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChild("Humanoid") then
+            char.Humanoid.WalkSpeed = value
+        end
+    end,
+})
+
+-- Jump Power
+local jumpPower = 50
+MainTab:CreateSlider({
+    Name = "Jump Power",
+    Range = {50, 300},
+    Increment = 1,
+    Suffix = "jp",
+    CurrentValue = 50,
+    Flag = "jumpPower",
+    Callback = function(value)
+        jumpPower = value
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChild("Humanoid") then
+            char.Humanoid.JumpPower = value
+        end
+    end,
+})
+
+-- Infinite Jump
+local infiniteJump = false
+MainTab:CreateToggle({
+    Name = "Infinite jump",
+    CurrentValue = false,
+    Flag = "infiniteJump",
+    Callback = function(state)
+        infiniteJump = state
+    end,
+})
+
+UserInputService.InputBegan:Connect(function(input)
+    if infiniteJump and input.KeyCode == Enum.KeyCode.Space then
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChild("Humanoid") then
+            char.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+end)
+
+-- Fly (no clip)
+local flyEnabled = false
+MainTab:CreateToggle({
+    Name = "Fly (no clip)",
+    CurrentValue = false,
+    Flag = "fly",
+    Callback = function(state)
+        flyEnabled = state
+        if state then
+            task.spawn(function()
+                local char = LocalPlayer.Character
+                if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+                local hrp = char.HumanoidRootPart
+                local bv = Instance.new("BodyVelocity")
+                bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                bv.Velocity = Vector3.new(0, 0, 0)
+                bv.Parent = hrp
+                local bg = Instance.new("BodyGyro")
+                bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+                bg.CFrame = hrp.CFrame
+                bg.Parent = hrp
+                while flyEnabled and bv.Parent and bg.Parent do
+                    Camera = Workspace.CurrentCamera
+                    if not Camera then
+                        task.wait(0.1)
+                        continue
+                    end
+                    local camCF = Camera.CFrame
+                    local move = Vector3.new(0, 0, 0)
+                    if UserInputService:IsKeyDown(Enum.KeyCode.W) then move = move + camCF.LookVector end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.S) then move = move - camCF.LookVector end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.A) then move = move - camCF.RightVector end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.D) then move = move + camCF.RightVector end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then move = move + Vector3.new(0, 1, 0) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then move = move - Vector3.new(0, 1, 0) end
+                    bv.Velocity = move * 50
+                    bg.CFrame = camCF
+                    task.wait()
+                end
+                if bv then pcall(function() bv:Destroy() end) end
+                if bg then pcall(function() bg:Destroy() end) end
+            end)
+        end
+    end,
+})
+
+MainTab:CreateDivider()
+
+
+-- ======================================================================
+-- SECTION 5: Shop Tab (s10)
+-- ======================================================================
+
+local ShopTab = Window:CreateTab("Shop", "shopping-cart")
+
+
+-- ======================================================================
+-- SECTION 6: Pets Tab (s1)
+-- ======================================================================
+
+local PetsTab = Window:CreateTab("Pets")
+
+-- Pet Abilities section
+PetsTab:CreateSection("Pet Abilities")
+
+-- Auto Find Choc Easter Bunny Eggs
+PetsTab:CreateToggle({
+    Name = "Auto Find Choc Easter Bunny Eggs",
+    CurrentValue = false,
+    Flag = "autoChocEggs",
+    Callback = function(state)
+        setWorker("Auto Find Choc Easter Bunny Eggs", state, 1, function()
+            safeBHCall("findChocEggs")
+        end)
+    end,
+})
+
+PetsTab:CreateDivider()
+
+-- Auto Favorite/Unfavorite Pet
+PetsTab:CreateSection("Auto Favorite/Unfavorite Pet")
+
+ENV.isAutoUnfavModeActive = false
+
+PetsTab:CreateDropdown({
+    Name = "Select Mode",
+    Options = {"Auto Favorite", "Auto Unfavorite"},
+    CurrentOption = {},
+    MultipleOptions = false,
+    Flag = "autoFavMode",
+    Callback = function(option)
+        local mode = firstOption(option)
+        ENV.isAutoUnfavModeActive = mode == "Auto Unfavorite"
+    end,
+})
+
+-- Select Pet dropdown
+PetsTab:CreateDropdown({
+    Name = "Select Pet",
+    Options = {},  -- populated dynamically
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "petListForAutoFav",
+    Callback = function(options) end,
+})
+
+-- Search pet
+PetsTab:CreateInput({
+    Name = "Search",
+    PlaceholderText = "Search Pet...",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) end,
+})
+
+-- Select All / Clear buttons
+PetsTab:CreateButton({
+    Name = "Select All",
+    Callback = function() end,
+})
+PetsTab:CreateButton({
+    Name = "Clear list",
+    Callback = function() end,
+})
+
+-- KG mode
+PetsTab:CreateDropdown({
+    Name = "KG mode",
+    Options = {"Current KG", "Base KG"},
+    CurrentOption = {},
+    MultipleOptions = false,
+    Flag = "selectedKGTypeforAutoFav",
+    Callback = function(option) end,
+})
+
+PetsTab:CreateDropdown({
+    Name = "Below or Above",
+    Options = {"Below", "Above"},
+    CurrentOption = {},
+    MultipleOptions = false,
+    Flag = "selectedKGforAutoFav",
+    Callback = function(option) end,
+})
+
+local kgForAutoFavPet = 0
+PetsTab:CreateInput({
+    Name = "number",
+    PlaceholderText = "0",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        kgForAutoFavPet = tonumber(text) or 0
+    end,
+})
+
+ENV.isAutoUnfavToggleActive = false
+
+PetsTab:CreateToggle({
+    Name = "Auto Favorite or Unfavorite Pet",
+    CurrentValue = false,
+    Flag = "autoFavPet",
+    Callback = function(state)
+        ENV.isAutoUnfavToggleActive = state
+        setWorker("Auto Favorite or Unfavorite Pet", state, 1, function()
+            safeBHCall("autoFavPet")
+        end)
+    end,
+})
+
+-- Webhook settings
+PetsTab:CreateDivider()
+PetsTab:CreateInput({
+    Name = "Webhook URL",
+    PlaceholderText = "Enter webhook URL",
+    RemoveTextAfterFocusLost = false,
+    Flag = "webhookURL",
+    Callback = function(text) end,
+})
+PetsTab:CreateToggle({
+    Name = "Auto Elephant results",
+    CurrentValue = false,
+    Flag = "autoEleWebhook",
+    Callback = function(state) end,
+})
+PetsTab:CreateToggle({
+    Name = "Auto Nightmare results",
+    CurrentValue = false,
+    Flag = "autoNMwebhook",
+    Callback = function(state) end,
+})
+
+
+-- ======================================================================
+-- SECTION 7: Plants Tab (s2)
+-- ======================================================================
+
+local PlantsTab = Window:CreateTab("Plants")
+
+-- Listen for game notifications
+if Notification then
+    Notification.OnClientEvent:Connect(function(msg)
+        -- Handle game notifications
+    end)
+end
+
+PlantsTab:CreateSection("Auto Collect Fruit")
+
+-- Select Fruit dropdown
+local selectedFruit_autoCollect = {}
+PlantsTab:CreateDropdown({
+    Name = "Select Fruit",
+    Options = {},  -- populated dynamically
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "selectedFruit_autoCollect",
+    Callback = function(options)
+        selectedFruit_autoCollect = options
+    end,
+})
+
+-- Search fruit
+PlantsTab:CreateInput({
+    Name = "Search fruit",
+    PlaceholderText = "fruit",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) end,
+})
+
+-- Select all / Clear buttons
+PlantsTab:CreateButton({
+    Name = "Select all fruits",
+    Callback = function() end,
+})
+PlantsTab:CreateButton({
+    Name = "Clear fruit",
+    Callback = function() end,
+})
+
+-- Select Variant
+PlantsTab:CreateDropdown({
+    Name = "Select Variant",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "selectedFruitVariant_autoCollect",
+    Callback = function(options) end,
+})
+
+-- Select Mutation
+PlantsTab:CreateDropdown({
+    Name = "Select Mutation",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "selectedFruitMutation_autoCollect",
+    Callback = function(options) end,
+})
+
+-- Search mutation
+PlantsTab:CreateInput({
+    Name = "Search mutation",
+    PlaceholderText = "mutation",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) end,
+})
+
+PlantsTab:CreateButton({
+    Name = "Select all mutations",
+    Callback = function() end,
+})
+PlantsTab:CreateButton({
+    Name = "Clear mutation",
+    Callback = function() end,
+})
+
+-- Below kg or Above kg
+PlantsTab:CreateDropdown({
+    Name = "Below kg or Above kg",
+    Options = {"Below", "Above"},
+    CurrentOption = {},
+    MultipleOptions = false,
+    Flag = "selectedFruitBelowOrAbove_autoCollect",
+    Callback = function(option) end,
+})
+
+-- KG threshold
+local autoCollect_kg = 0
+PlantsTab:CreateInput({
+    Name = "number",
+    PlaceholderText = "0",
+    RemoveTextAfterFocusLost = false,
+    Flag = "autoCollect_kg",
+    Callback = function(text)
+        autoCollect_kg = tonumber(text) or 0
+    end,
+})
+
+-- Delay to collect
+local delayToCollectFruits = 1
+PlantsTab:CreateInput({
+    Name = "Delay to Collect",
+    PlaceholderText = "1",
+    RemoveTextAfterFocusLost = false,
+    Flag = "delayToCollectFruits",
+    Callback = function(text)
+        delayToCollectFruits = math.max(0.03, tonumber(text) or 1)
+    end,
+})
+
+-- Auto Sell When Full
+PlantsTab:CreateToggle({
+    Name = "Auto Sell All fruits When Full",
+    CurrentValue = false,
+    Flag = "autoSellWhenFull",
+    Callback = function(state) end,
+})
+
+-- Stop collect when full
+PlantsTab:CreateToggle({
+    Name = "Stop collect when full",
+    CurrentValue = false,
+    Flag = "stopCollectWhenFull",
+    Callback = function(state) end,
+})
+
+-- Auto collect toggle
+PlantsTab:CreateToggle({
+    Name = "Auto Collect",
+    CurrentValue = false,
+    Flag = "autoCollectFruits",
+    Callback = function(state)
+        setWorker("Auto Collect", state, delayToCollectFruits, function()
+            safeBHCall("collectFruits", selectedFruit_autoCollect)
+        end)
+    end,
+})
+
+
+-- ======================================================================
+-- SECTION 8: Automation Tab (s3)
+-- ======================================================================
+
+local AutoTab = Window:CreateTab("Automation")
+
+-- Cancel Animation A
+AutoTab:CreateSection("Cancel Animation A")
+AutoTab:CreateParagraph({
+    Title = "Pickup/Place:",
+    Content = "None",
+})
+
+local selectPetsForCancelAnim = {}
+AutoTab:CreateDropdown({
+    Name = "Select Pet/s",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "selectPetsForCancelAnim",
+    Callback = function(options)
+        selectPetsForCancelAnim = options
+    end,
+})
+
+AutoTab:CreateButton({
+    Name = "Refresh list",
+    Callback = function() end,
+})
+AutoTab:CreateButton({
+    Name = "Clear Selected",
+    Callback = function() end,
+})
+
+local animationCancelDelay = 0
+AutoTab:CreateInput({
+    Name = "Animation Cancel delay",
+    PlaceholderText = "seconds",
+    RemoveTextAfterFocusLost = false,
+    Flag = "animationCancelDelay",
+    Callback = function(text)
+        animationCancelDelay = math.max(0, tonumber(text) or 0)
+    end,
+})
+
+AutoTab:CreateToggle({
+    Name = "Cancel Animation",
+    CurrentValue = false,
+    Flag = "cancelAnimation",
+    Callback = function(state)
+        setWorker("Cancel Animation", state, math.max(animationCancelDelay, 0.03), function()
+            safeBHCall("cancelAnimation", selectPetsForCancelAnim, animationCancelDelay)
+        end)
+    end,
+})
+
+AutoTab:CreateDivider()
+
+-- Cancel Animation B
+AutoTab:CreateSection("Cancel Animation B")
+AutoTab:CreateParagraph({Title = "Pickup/Place B:", Content = "None"})
+
+local selectPetsForCancelAnimB = {}
+local animationCancelDelayB = 0
+AutoTab:CreateDropdown({
+    Name = "Select Pet/s B",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "selectPetsForCancelAnimB",
+    Callback = function(options)
+        selectPetsForCancelAnimB = type(options) == "table" and options or {}
+    end,
+})
+AutoTab:CreateButton({Name = "Refresh list B", Callback = function() end})
+AutoTab:CreateButton({Name = "Clear Selected B", Callback = function() end})
+AutoTab:CreateInput({
+    Name = "Animation Cancel delay B",
+    PlaceholderText = "seconds",
+    RemoveTextAfterFocusLost = false,
+    Flag = "animationCancelDelayB",
+    Callback = function(text)
+        animationCancelDelayB = math.max(0, tonumber(text) or 0)
+    end,
+})
+AutoTab:CreateToggle({
+    Name = "Cancel Animation B",
+    CurrentValue = false,
+    Flag = "cancelAnimationB",
+    Callback = function(state)
+        setWorker("Cancel Animation B", state, math.max(animationCancelDelayB, 0.03), function()
+            safeBHCall("cancelAnimation", selectPetsForCancelAnimB, animationCancelDelayB)
+        end)
+    end,
+})
+
+AutoTab:CreateDivider()
+
+-- Cancel Animation C
+AutoTab:CreateSection("Cancel Animation C")
+AutoTab:CreateParagraph({Title = "Pickup/Place C:", Content = "None"})
+
+local selectPetsForCancelAnimC = {}
+local animationCancelDelayC = 0
+AutoTab:CreateDropdown({
+    Name = "Select Pet/s C",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "selectPetsForCancelAnimC",
+    Callback = function(options)
+        selectPetsForCancelAnimC = type(options) == "table" and options or {}
+    end,
+})
+AutoTab:CreateButton({Name = "Refresh list C", Callback = function() end})
+AutoTab:CreateButton({Name = "Clear Selected C", Callback = function() end})
+AutoTab:CreateInput({
+    Name = "Animation Cancel delay C",
+    PlaceholderText = "seconds",
+    RemoveTextAfterFocusLost = false,
+    Flag = "animationCancelDelayC",
+    Callback = function(text)
+        animationCancelDelayC = math.max(0, tonumber(text) or 0)
+    end,
+})
+AutoTab:CreateToggle({
+    Name = "Cancel Animation C",
+    CurrentValue = false,
+    Flag = "cancelAnimationC",
+    Callback = function(state)
+        setWorker("Cancel Animation C", state, math.max(animationCancelDelayC, 0.03), function()
+            safeBHCall("cancelAnimation", selectPetsForCancelAnimC, animationCancelDelayC)
+        end)
+    end,
+})
+
+-- 9 pets tech settings
+AutoTab:CreateDivider()
+AutoTab:CreateSection("9 Pets Tech")
+
+local mimicsListFor9Pets = {}
+local spiderFor9Pets = nil
+local eagleFor9Pets = nil
+local delayToStayInSpider = 1
+local delayToStayInEagle = 1
+
+AutoTab:CreateDropdown({
+    Name = "Select Mimic/s",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "mimicsListFor9Pets",
+    Callback = function(options)
+        mimicsListFor9Pets = type(options) == "table" and options or {}
+    end,
+})
+AutoTab:CreateDropdown({
+    Name = "Select Spider",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = false,
+    Flag = "spiderFor9Pets",
+    Callback = function(option)
+        spiderFor9Pets = firstOption(option)
+    end,
+})
+AutoTab:CreateDropdown({
+    Name = "Select Eagle",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = false,
+    Flag = "eagleFor9Pets",
+    Callback = function(option)
+        eagleFor9Pets = firstOption(option)
+    end,
+})
+AutoTab:CreateInput({
+    Name = "Delay to stay in Spider",
+    PlaceholderText = "1",
+    RemoveTextAfterFocusLost = false,
+    Flag = "delayToStayInSpider",
+    Callback = function(text)
+        delayToStayInSpider = math.max(0, tonumber(text) or 1)
+    end,
+})
+AutoTab:CreateInput({
+    Name = "Delay to stay in Eagle",
+    PlaceholderText = "1",
+    RemoveTextAfterFocusLost = false,
+    Flag = "delayToStayInEagle",
+    Callback = function(text)
+        delayToStayInEagle = math.max(0, tonumber(text) or 1)
+    end,
+})
+
+
+-- ======================================================================
+-- SECTION 9: Inventory Tab (s4)
+-- ======================================================================
+
+local InvTab = Window:CreateTab("Inventory")
+
+InvTab:CreateSection("General Crafting")
+
+-- Workbench types
+local workbenchTypes = {
+    "GearEventWorkbench",
+    "SeedEventWorkbench",
+    "GiantBeanstalkEventWorkbench",
+}
+
+local dropdownSelectedWorkbench = workbenchTypes[1]
+InvTab:CreateDropdown({
+    Name = "Select Workbench (For craft or claim)",
+    Options = workbenchTypes,
+    CurrentOption = {workbenchTypes[1]},
+    MultipleOptions = false,
+    Flag = "dropdownSelectedWorkbench",
+    Callback = function(option)
+        dropdownSelectedWorkbench = firstOption(option)
+    end,
+})
+
+local dropdownSelectedRecipeGeneral = nil
+InvTab:CreateDropdown({
+    Name = "Select Recipe",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = false,
+    Flag = "dropdownSelectedRecipeGeneral",
+    Callback = function(option)
+        dropdownSelectedRecipeGeneral = firstOption(option)
+    end,
+})
+
+InvTab:CreateParagraph({Title = "Crafting Materials:", Content = ""})
+
+InvTab:CreateButton({
+    Name = "Craft",
+    Callback = function()
+        safeBHCall("craftItem", dropdownSelectedWorkbench, dropdownSelectedRecipeGeneral)
+    end,
+})
+InvTab:CreateButton({
+    Name = "Claim",
+    Callback = function()
+        safeBHCall("claimItem", dropdownSelectedWorkbench)
+    end,
+})
+
+
+-- ======================================================================
+-- SECTION 10: Event Tab (s5)
+-- ======================================================================
+
+local EventTab = Window:CreateTab("Event")
+
+EventTab:CreateSection("Fall Event - Part 1")
+
+EventTab:CreateParagraph({Title = "Fall Bloom", Content = ""})
+
+EventTab:CreateToggle({
+    Name = "Auto Collect Wanted Fruits",
+    CurrentValue = false,
+    Flag = "autoCollectWantedFruits",
+    Callback = function(state) end,
+})
+
+EventTab:CreateToggle({
+    Name = "Auto Feed All Fruits to Harvest Spirit",
+    CurrentValue = false,
+    Flag = "autoFeedAllFruits",
+    Callback = function(state) end,
+})
+
+EventTab:CreateDivider()
+EventTab:CreateSection("Fall Event - Part 2")
+
+EventTab:CreateParagraph({Title = "Acorn Chaos", Content = ""})
+EventTab:CreateParagraph({Title = "", Content = "You must enable toggle below before the event starts."})
+
+EventTab:CreateToggle({
+    Name = "Auto Crack Acorns (VULN)",
+    CurrentValue = false,
+    Flag = "autoCrack",
+    Callback = function(state) end,
+})
+
+-- Promo code
+EventTab:CreateButton({
+    Name = "Submit Code: ROBLOX20",
+    Callback = function()
+        safeBHCall("submitCode", "ROBLOX20")
+    end,
+})
+
+EventTab:CreateToggle({
+    Name = "Auto Submit Stolen Fruits (VULN)",
+    CurrentValue = false,
+    Flag = "autoSubmitStolenFruits",
+    Callback = function(state) end,
+})
+
+-- Event Shop
+EventTab:CreateSection("Event Shop")
+EventTab:CreateParagraph({Title = "Special Currencies:", Content = "Loading..."})
+
+task.spawn(function()
+    task.wait(2)
+    -- Update currency display
+end)
+
+local autoBuyEventShopItems = {}
+EventTab:CreateDropdown({
+    Name = "Select Items",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "autoBuyEventShopItems",
+    Callback = function(options) end,
+})
+
+EventTab:CreateInput({
+    Name = "Search",
+    PlaceholderText = "Search Item...",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) end,
+})
+
+EventTab:CreateButton({
+    Name = "Clear",
+    Callback = function() end,
+})
+
+EventTab:CreateToggle({
+    Name = "Auto Buy Event Shop",
+    CurrentValue = false,
+    Flag = "autoBuyEventShop",
+    Callback = function(state) end,
+})
+
+
+-- ======================================================================
+-- SECTION 11: Loadouts Tab (s7)
+-- ======================================================================
+
+local LoadoutsTab = Window:CreateTab("Loadouts")
+
+LoadoutsTab:CreateSection("Save custom team")
+
+-- Create BeastHub folder only when the executor exposes file APIs.
+do
+    if type(isfolder) == "function" and type(makefolder) == "function" then
+        local okCheck, exists = pcall(isfolder, "BeastHub")
+        if okCheck and not exists then
+            local okCreate, createErr = pcall(makefolder, "BeastHub")
+            if not okCreate then
+                bhWarn("loadouts folder", createErr)
+            end
+        elseif not okCheck then
+            bhWarn("loadouts folder", exists)
+        end
+    else
+        bhWarn("loadouts folder", "file APIs are unavailable; saved loadouts may be disabled")
+    end
+end
+
+local loadoutName = ""
+LoadoutsTab:CreateInput({
+    Name = "Set Name",
+    CurrentValue = "",
+    PlaceholderText = "text",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        loadoutName = text
+    end,
+})
+
+LoadoutsTab:CreateButton({
+    Name = "Save current team",
+    Callback = function()
+        if loadoutName ~= "" then
+            safeBHCall("saveLoadout", loadoutName)
+            local currentTeam = safeBHCall("getCurrentTeam")
+            if currentTeam ~= nil then
+                ENV.preloadedCustomLoadouts[loadoutName] = currentTeam
+            end
+            if not table.find(ENV.preloadedCustomLoadoutNames, loadoutName) then
+                table.insert(ENV.preloadedCustomLoadoutNames, loadoutName)
+            end
+        end
+    end,
+})
+
+LoadoutsTab:CreateParagraph({
+    Title = "How to use saved teams/loadouts?",
+    Content = "Go to any loadout dropdown selection and they will show up there. " ..
+              "Example: Eggs tab auto hatching select Koi loadout, " ..
+              "Pets tab auto mutations Leveling loadout, etc.",
+})
+
+LoadoutsTab:CreateDivider()
+LoadoutsTab:CreateSection("Load custom team")
+
+LoadoutsTab:CreateParagraph({Title = "File name", Content = "None"})
+
+local refreshLoadouts = nil
+LoadoutsTab:CreateDropdown({
+    Name = "Select",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = false,
+    Flag = "refreshLoadouts",
+    Callback = function(option)
+        refreshLoadouts = firstOption(option)
+    end,
+})
+
+LoadoutsTab:CreateButton({
+    Name = "Refresh List",
+    Callback = function() end,
+})
+LoadoutsTab:CreateButton({
+    Name = "Load",
+    Callback = function() end,
+})
+LoadoutsTab:CreateButton({
+    Name = "Delete Loadout",
+    Callback = function() end,
+})
+
+-- Get equipped pets from DataService without crashing if the game's module layout changed.
+local DataService = nil
+local PetsData = {}
+local EquippedPets = {}
+
+do
+    local modulesFolder = ReplicatedStorage:FindFirstChild("Modules")
+    local dataServiceModule = modulesFolder and modulesFolder:FindFirstChild("DataService")
+
+    if dataServiceModule and dataServiceModule:IsA("ModuleScript") then
+        DataService = safeRequire(dataServiceModule, "DataService")
+    else
+        bhWarn("DataService", "ReplicatedStorage.Modules.DataService was not found")
+    end
+
+    if type(DataService) == "table" and type(DataService.GetData) == "function" then
+        local okData, playerData = pcall(function()
+            return DataService:GetData(LocalPlayer)
+        end)
+
+        if okData and type(playerData) == "table" and type(playerData.PetsData) == "table" then
+            PetsData = playerData.PetsData
+            if type(PetsData.EquippedPets) == "table" then
+                EquippedPets = PetsData.EquippedPets
+            end
+        elseif not okData then
+            bhWarn("DataService:GetData", playerData)
+        else
+            bhWarn("DataService:GetData", "PetsData was unavailable")
+        end
+    end
+end
+
+
+-- ======================================================================
+-- SECTION 12: Trader Tab (s8)
+-- ======================================================================
+
+local TraderTab = Window:CreateTab("Trader")
+
+TraderTab:CreateSection("Trading Ticket")
+
+TraderTab:CreateButton({
+    Name = "Hide Trade ticket window",
+    Callback = function()
+        safeBHCall("hideTradeTicket")
+    end,
+})
+TraderTab:CreateButton({
+    Name = "Unhide Trade ticket window",
+    Callback = function()
+        safeBHCall("unhideTradeTicket")
+    end,
+})
+
+TraderTab:CreateDivider()
+TraderTab:CreateSection("Trading Booth")
+
+TraderTab:CreateToggle({
+    Name = "Auto Claim Booth",
+    CurrentValue = false,
+    Flag = "autoClaimBooth",
+    Callback = function(state)
+        setWorker("Auto Claim Booth", state, 5, function()
+            safeBHCall("claimBooth")
+        end)
+    end,
+})
+
+-- Auto Create Listing (Pet)
+TraderTab:CreateParagraph({Title = "Pets:", Content = "None"})
+
+local selectPetsForCreateListing = {}
+TraderTab:CreateDropdown({
+    Name = "Select Pet/s",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "selectPetsForCreateListing",
+    Callback = function(options)
+        selectPetsForCreateListing = type(options) == "table" and options or {}
+    end,
+})
+
+TraderTab:CreateInput({
+    Name = "Search",
+    PlaceholderText = "Search Pet...",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text) end,
+})
+
+TraderTab:CreateButton({
+    Name = "Clear selection",
+    Callback = function() end,
+})
+
+local listBelowKGNew = 0
+TraderTab:CreateInput({
+    Name = "List Below (KG)",
+    PlaceholderText = "0",
+    RemoveTextAfterFocusLost = false,
+    Flag = "listBelowKGNew",
+    Callback = function(text)
+        listBelowKGNew = tonumber(text) or 0
+    end,
+})
+
+local tokenPriceForListing = 0
+TraderTab:CreateInput({
+    Name = "Token Price",
+    PlaceholderText = "Tokens",
+    RemoveTextAfterFocusLost = false,
+    Flag = "tokenPriceForListing",
+    Callback = function(text)
+        tokenPriceForListing = tonumber(text) or 0
+    end,
+})
+
+TraderTab:CreateToggle({
+    Name = "Auto Create Listings (Pet)",
+    CurrentValue = false,
+    Flag = "autoCreateListings",
+    Callback = function(state)
+        setWorker("Auto Create Listings (Pet)", state, 5, function()
+            safeBHCall("createListing", selectPetsForCreateListing, listBelowKGNew, tokenPriceForListing)
+        end)
+    end,
+})
+
+-- Second listing slot
+local selectPetsForCreateListing2 = {}
+local listBelowKGNew2 = 0
+local tokenPriceForListing2 = 0
+
+TraderTab:CreateDropdown({
+    Name = "Select Pet/s (Slot 2)",
+    Options = {},
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "selectPetsForCreateListing2",
+    Callback = function(options)
+        selectPetsForCreateListing2 = type(options) == "table" and options or {}
+    end,
+})
+TraderTab:CreateInput({
+    Name = "List Below (KG) 2",
+    PlaceholderText = "0",
+    RemoveTextAfterFocusLost = false,
+    Flag = "listBelowKGNew2",
+    Callback = function(text)
+        listBelowKGNew2 = tonumber(text) or 0
+    end,
+})
+TraderTab:CreateInput({
+    Name = "Token Price 2",
+    PlaceholderText = "Tokens",
+    RemoveTextAfterFocusLost = false,
+    Flag = "tokenPriceForListing2",
+    Callback = function(text)
+        tokenPriceForListing2 = tonumber(text) or 0
+    end,
+})
+TraderTab:CreateToggle({
+    Name = "Auto Create Listings 2 (Pet)",
+    CurrentValue = false,
+    Flag = "autoCreateListings2",
+    Callback = function(state)
+        setWorker("Auto Create Listings 2 (Pet)", state, 5, function()
+            safeBHCall("createListing", selectPetsForCreateListing2, listBelowKGNew2, tokenPriceForListing2)
+        end)
+    end,
+})
+
+-- Webhook for snipe
+TraderTab:CreateDivider()
+TraderTab:CreateInput({
+    Name = "Webhook URL",
+    PlaceholderText = "Enter webhook URL",
+    RemoveTextAfterFocusLost = false,
+    Flag = "traderWebhookURL",
+    Callback = function(text) end,
+})
+TraderTab:CreateToggle({
+    Name = "Auto Snipe Webhook",
+    CurrentValue = false,
+    Flag = "autoSnipeWebhook",
+    Callback = function(state) end,
+})
+
+
+-- ======================================================================
+-- SECTION 13: Mail Tab (s11)
+-- ======================================================================
+
+local MailTab = Window:CreateTab("Mail", "mail")
+
+MailTab:CreateSection("Mail - Single select")
+
+-- Build a Rayfield-safe item list. Dropdown options must be strings, while
+-- sendMail can still receive the original item object through mailItemMap.
+local mailItems = {}
+local mailItemMap = {}
+
+for category, items in pairs(PetsData or {}) do
+    if type(items) == "table" and category ~= "EquippedPets" then
+        for key, item in pairs(items) do
+            local label
+            if type(item) == "table" then
+                label = item.DisplayName
+                    or item.ItemName
+                    or item.Name
+                    or item.name
+                    or item.UUID
+                    or item.Id
+                    or item.ID
+            elseif type(item) == "string" or type(item) == "number" then
+                label = tostring(item)
+            end
+
+            label = tostring(label or key or "Unknown item")
+            local uniqueLabel = label
+            local suffix = 2
+            while mailItemMap[uniqueLabel] ~= nil do
+                uniqueLabel = ("%s (%d)"):format(label, suffix)
+                suffix += 1
+            end
+
+            mailItemMap[uniqueLabel] = item
+            table.insert(mailItems, uniqueLabel)
+        end
+    end
+end
+
+table.sort(mailItems)
+
+local selectedMailItem = nil
+MailTab:CreateDropdown({
+    Name = "Item list",
+    Options = mailItems,
+    CurrentOption = {},
+    MultipleOptions = false,
+    AllowNone = true,
+    Callback = function(option)
+        local label = firstOption(option)
+        selectedMailItem = label and mailItemMap[label] or nil
+    end,
+})
+
+local mailRecipient = ""
+MailTab:CreateInput({
+    Name = "Send to",
+    InputIcon = "user",
+    Type = "text",
+    CurrentValue = "",
+    PlaceholderText = "@username",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        mailRecipient = text
+    end,
+})
+
+local mailQty = 1
+MailTab:CreateInput({
+    Name = "Qty",
+    InputIcon = "calculator",
+    Type = "number",
+    CurrentValue = "1",
+    PlaceholderText = "1",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        mailQty = tonumber(text) or 1
+    end,
+})
+
+local mailNote = ""
+MailTab:CreateInput({
+    Name = "Note",
+    InputIcon = "scroll",
+    Type = "text",
+    CurrentValue = "",
+    PlaceholderText = "note",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(text)
+        mailNote = text
+    end,
+})
+
+MailTab:CreateButton({
+    Name = "Send",
+    Callback = function()
+        if selectedMailItem and mailRecipient ~= "" then
+            local recipient = mailRecipient:lower()
+            if recipient:sub(1, 1) == "@" then
+                recipient = recipient:sub(2)
+            end
+            safeBHCall("sendMail", {
+                recipient = recipient,
+                item = selectedMailItem,
+                qty = math.max(1, math.floor(mailQty)),
+                note = mailNote,
+            })
+        end
+    end,
+})
+
+MailTab:CreateDivider()
+MailTab:CreateParagraph({Title = "Mail - Batch (coming soon..)", Content = ""})
+
+-- Load ReplicaClient for mail operations without hard-failing if the path changed.
+local ReplicaClient = nil
+do
+    local clientModules = ReplicatedStorage:FindFirstChild("ClientModules")
+    local replicaModule = clientModules and clientModules:FindFirstChild("ReplicaClient")
+    if replicaModule and replicaModule:IsA("ModuleScript") then
+        ReplicaClient = safeRequire(replicaModule, "ReplicaClient")
+    else
+        bhWarn("ReplicaClient", "module was not found; mail helper may still work through BeastHubFunctions")
+    end
+end
+
+
+-- ======================================================================
+-- SECTION 14: Initialize Modules
+-- ======================================================================
+
+-- Initialize BeastHubFunctions without turning an init failure into a hard script error.
+do
+    local initFn = BeastHubFunctions and BeastHubFunctions.init
+    if type(initFn) == "function" then
+        local okInit, initErr = pcall(function()
+            BeastHubFunctions:init()
+        end)
+        if not okInit then
+            bhWarn("BeastHubFunctions:init", initErr)
+        end
+    else
+        bhWarn("BeastHubFunctions:init", "init function was not found")
+    end
+end
+
+-- Maintain WalkSpeed/JumpPower on respawn
+LocalPlayer.CharacterAdded:Connect(function(char)
+    task.wait(0.5)
+    if char:FindFirstChild("Humanoid") then
+        char.Humanoid.WalkSpeed = walkSpeed
+        char.Humanoid.JumpPower = jumpPower
+    end
+end)
+
+-- Set isSafeToPickPlace flag
+ENV.isSafeToPickPlace = true
+
+-- Notify on load
+pcall(function()
+    Rayfield:Notify({
+        Title = "BeastHub",
+        Content = "Grow a Garden loaded! Press H to toggle UI",
+        Duration = 5,
+    })
+end)
+
+-- Mark as loaded
+ENV.BeastHubLoaded = true
+ENV.ConfigLoaded = true
+
+-- End of BeastHub - Grow a Garden
